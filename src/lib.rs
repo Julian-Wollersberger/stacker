@@ -59,11 +59,27 @@ pub fn maybe_grow<R, F: FnOnce() -> R>(red_zone: usize, stack_size: usize, callb
 /// The closure will still be on the same thread as the caller of `grow`.
 /// This will allocate a new stack with at least `stack_size` bytes.
 pub fn grow<R, F: FnOnce() -> R>(stack_size: usize, callback: F) -> R {
+    // Measuring with cargo-llvm-lines revealed that `psm::on_stack::with_on_stack`
+    // was monomorphized 1552 times in rustc and was responsible for 1.5% of
+    // rustc's total llvm IR lines. That takes time for LLVM to process.
+    // Converting the generic callback to a dynamic one removes all that duplication.
+    let mut opt_callback = Some(callback);
     let mut ret = None;
     let ret_ref = &mut ret;
-    _grow(stack_size, move || {
-        *ret_ref = Some(callback());
-    });
+
+    // This wrapper around `callback` achieves two things:
+    // * It converts the `impl FnOnce` to a `dyn FnMut`.
+    //   `dyn` because we want it to not be generic, and
+    //   `FnMut` because we can't pass a `dyn FnOnce` around without boxing it.
+    // * It eliminates the generic return value, by writing it to the stack of this function.
+    //   Otherwise the closure would have to return an unsized value, which isn't possible.
+    let dyn_callback: &mut dyn FnMut() = &mut || {
+        let taken_callback = opt_callback.take().unwrap();
+        *ret_ref = Some(taken_callback());
+    };
+
+    // _grow is only monomorphized once with a `dyn` argument.
+    _grow(stack_size, dyn_callback);
     ret.unwrap()
 }
 
